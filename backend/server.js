@@ -1,84 +1,117 @@
 /**
- * Logistics Incident Copilot — Node.js Backend
- * ─────────────────────────────────────────────
+ * Logistics Incident Copilot — Node.js Backend v2
+ * ─────────────────────────────────────────────────
  * Setup:
- *   npm init -y
  *   npm install express openai dotenv cors
  *
  * .env:
  *   OPENAI_API_KEY=sk-...
  *   PORT=3001
  *
- * Run:
- *   node server.js
+ * Folder structure:
+ *   server.js
+ *   db/
+ *     carriers.json
+ *     shipments.json
+ *     incident_history.json
  */
 
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { config } from "dotenv";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
 config();
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const MODEL = "gpt-4o-mini"; // swap to "gpt-4o" for higher quality
+const MODEL = "gpt-4o-mini";
 
-// ─── HISTORICAL DATA (mock — replace with DB queries in production) ──────────
+// ─── LOAD MOCK DB ─────────────────────────────────────────────────────────────
 
-const HISTORICAL_DATA = {
-  breakdown: {
-    similar_incidents_12m: 7,
-    carrier_incidents: { ABC: 5, RMF: 1, ETG: 1 },
-    route_disruption_rate: { "Warsaw→Amsterdam": 0.18 },
-    avg_recovery_hours: 4.2,
-  },
-  weather: {
-    similar_incidents_12m: 12,
-    highest_disruption_quarter: "Q1 (Jan–Mar)",
-    total_penalty_ytd_eur: 31000,
-    successful_reroutes: 4,
-    reroute_avg_cost_eur: 260,
-  },
-  cancellation: {
-    similar_incidents_12m: 4,
-    carrier_cancellations: { ETG: 4 },
-    pharma_cargo_incidents: 3,
-    total_exposure_eur: 18000,
-    etg_cancellation_rate_pct: 8.3,
-  },
+const db = {
+  carriers: JSON.parse(readFileSync(join(__dirname, "db/carriers.json"), "utf8")),
+  shipments: JSON.parse(readFileSync(join(__dirname, "db/shipments.json"), "utf8")),
+  incidents: JSON.parse(readFileSync(join(__dirname, "db/incident_history.json"), "utf8")),
 };
+
+// ─── DB QUERY HELPERS ─────────────────────────────────────────────────────────
+
+function getShipment(shipmentId) {
+  return db.shipments.find(s => s.id === shipmentId) || null;
+}
+
+function getCarrier(carrierId) {
+  return db.carriers.find(c => c.id === carrierId) || null;
+}
+
+function findBackupCarriers(route, cargoType, tempRequired, excludeCarrierId) {
+  return db.carriers.filter(c =>
+    c.id !== excludeCarrierId &&
+    c.available_trucks > 0 &&
+    (tempRequired ? c.temp_controlled === true : true) &&
+    (c.active_routes.includes(route) || c.specializations.includes(cargoType))
+  ).sort((a, b) => b.rating - a.rating);
+}
+
+function getIncidentHistory(incidentType, carrierId, route) {
+  const byCarrier = db.incidents.filter(i => i.carrier_id === carrierId);
+  const byRoute   = db.incidents.filter(i => i.route === route);
+  const byType    = db.incidents.filter(i => i.type === incidentType);
+
+  return {
+    carrier_total_incidents: byCarrier.length,
+    carrier_same_type: byCarrier.filter(i => i.type === incidentType).length,
+    route_disruption_count: byRoute.length,
+    type_total_in_network: byType.length,
+    avg_cost_delta_eur: byType.length
+      ? Math.round(byType.reduce((s, i) => s + i.cost_delta_eur, 0) / byType.length)
+      : 0,
+    deadline_met_rate_pct: byType.length
+      ? Math.round((byType.filter(i => i.deadline_met).length / byType.length) * 100)
+      : 0,
+    most_used_resolution: (() => {
+      const counts = {};
+      byType.forEach(i => { counts[i.resolution_label] = (counts[i.resolution_label] || 0) + 1; });
+      return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] || "N/A";
+    })(),
+    recent_incidents: byCarrier.slice(-3).map(i => ({
+      date: i.date, type: i.type,
+      resolution: i.resolution_label, deadline_met: i.deadline_met,
+    })),
+  };
+}
 
 // ─── PROMPT BUILDERS ─────────────────────────────────────────────────────────
 
-function buildAnalysisPrompt(incidentType, incidentDescription, shipment) {
-  const hist = HISTORICAL_DATA[incidentType];
-  return `You are an expert logistics operations AI. Analyze the incident below and respond ONLY with valid JSON — no markdown, no explanation, no code fences.
+function buildAnalysisPrompt(incidentType, incidentDescription, shipment, carrier, backupCarriers, history) {
+  return `You are an expert logistics operations AI. Analyze this incident and return ONLY valid JSON — no markdown, no explanation.
 
 INCIDENT TYPE: ${incidentType.toUpperCase()}
 DESCRIPTION: ${incidentDescription}
 
-SHIPMENT:
-  ID: ${shipment.shipmentId}
-  Route: ${shipment.route}
-  Cargo: ${shipment.cargo}
-  Carrier: ${shipment.carrier} (ID: ${shipment.carrierId})
-  Client: ${shipment.client}
-  Current ETA: ${shipment.eta}
-  Cargo Value: ${shipment.value}
-  Position: ${shipment.position}
-  KM Remaining: ${shipment.kmLeft}
-  Hours to Deadline: ${shipment.hoursToDeadline}
+AFFECTED SHIPMENT:
+${JSON.stringify(shipment, null, 2)}
 
-HISTORICAL DATA:
-${JSON.stringify(hist, null, 2)}
+CURRENT CARRIER PROFILE:
+${JSON.stringify(carrier, null, 2)}
 
-Respond with exactly this JSON structure:
+AVAILABLE BACKUP CARRIERS (top 3 by rating, filtered for this route/cargo):
+${JSON.stringify(backupCarriers.slice(0, 3), null, 2)}
+
+HISTORICAL INCIDENT DATA (this carrier + route + type):
+${JSON.stringify(history, null, 2)}
+
+Based on ALL the above real data, generate a response in this exact JSON structure:
 {
-  "severity": "HIGH" | "CRITICAL" | "MEDIUM",
+  "severity": "HIGH",
   "key_facts": [
     { "label": "string", "value": "string" }
   ],
@@ -86,90 +119,67 @@ Respond with exactly this JSON structure:
     {
       "id": "A",
       "label": "short action title",
-      "time_impact": "delivery time description",
-      "cost_delta": "+€XXX or €0",
-      "risk_level": "Low" | "Medium" | "High",
-      "recommended": true | false,
-      "note": "one sentence rationale",
-      "action_carrier": "carrier name or action taken",
-      "action_eta": "new ETA string"
+      "time_impact": "specific delivery time",
+      "cost_delta": "+€XXX",
+      "risk_level": "Low",
+      "recommended": true,
+      "note": "one sentence — reference actual carrier names and costs from the data",
+      "action_carrier": "use actual carrier name from backup list",
+      "action_eta": "specific new ETA"
     }
   ],
-  "recommended_option": "A" | "B" | "C",
-  "reasoning": "2-3 sentence explanation of why this option is best"
+  "recommended_option": "A",
+  "reasoning": "2-3 sentences referencing actual data: carrier rating, history, costs"
 }
 
 Rules:
-- Always provide exactly 3 options (A, B, C)
-- Exactly one option has recommended: true
-- key_facts must have 5 items
-- Be specific with costs and times based on the scenario`;
+- Exactly 3 options (A, B, C), exactly one recommended: true
+- 5 key_facts items
+- Use REAL carrier names from the backup list
+- Reference actual ratings, prices, history numbers in reasoning
+- Be specific with ETA times based on hours_to_deadline`;
 }
 
 function buildClientMessagePrompt(incidentType, selectedOption, optionDetails, shipment) {
-  return `You are a logistics operations manager writing a client notification email.
+  return `Write a professional logistics client notification email body.
 
-SITUATION:
-  Shipment: ${shipment.shipmentId}
-  Route: ${shipment.route}
-  Cargo: ${shipment.cargo}
-  Client: ${shipment.client}
-  Incident: ${incidentType}
-  Resolution chosen: Option ${selectedOption}
-  New carrier / action: ${optionDetails.actionCarrier}
-  New ETA: ${optionDetails.actionEta}
-  Cost impact: ${optionDetails.costDelta}
+Shipment ID: ${shipment.id}
+Route: ${shipment.route}
+Cargo: ${shipment.cargo}
+Client: ${shipment.client}
+Incident: ${incidentType}
+Resolution: ${optionDetails.action_carrier}
+New ETA: ${optionDetails.action_eta}
+Cost impact: ${optionDetails.cost_delta}
 
-Write a professional, empathetic 3-paragraph email body (no subject line):
-1. Briefly explain what happened
-2. Explain what action was taken and the new ETA
-3. Apologize and offer contact for questions
-
-Be specific — use the shipment ID, route, and actual details. Sound human, not template-like.
-Return only the email text. No JSON, no markdown, no subject line.`;
+3 paragraphs: (1) what happened, (2) what was done and new ETA, (3) apology and contact offer.
+Use the shipment ID and actual details. Sound human. Return only the email body — no subject, no JSON.`;
 }
 
-function buildLessonsPrompt(incidentType, selectedOption, shipment) {
-  const hist = HISTORICAL_DATA[incidentType];
-  return `You are a logistics analytics expert generating a post-incident lessons learned report.
+function buildLessonsPrompt(incidentType, shipment, carrier, history) {
+  return `Generate a post-incident lessons learned report based on this real data.
 
-INCIDENT: ${incidentType} on route ${shipment.route}
-CARRIER: ${shipment.carrier} (${shipment.carrierId})
-RESOLUTION: Option ${selectedOption} was chosen
-HISTORICAL DATA: ${JSON.stringify(hist, null, 2)}
+Incident type: ${incidentType}
+Route: ${shipment.route}
+Carrier: ${carrier.name} (rating: ${carrier.rating}, breakdown rate: ${carrier.breakdown_rate_pct}%, cancellation rate: ${carrier.cancellation_rate_pct}%)
+Historical analysis: ${JSON.stringify(history, null, 2)}
 
-Respond ONLY with valid JSON, no markdown, no code fences:
+Return ONLY valid JSON:
 {
   "stats": [
-    { "value": "number or %", "label": "context description" },
-    { "value": "number or %", "label": "context description" },
-    { "value": "number or %", "label": "context description" }
+    { "value": "string", "label": "string" },
+    { "value": "string", "label": "string" },
+    { "value": "string", "label": "string" }
   ],
   "insights": [
-    "data-backed insight 1",
-    "data-backed insight 2",
-    "data-backed insight 3"
+    "specific insight referencing real numbers",
+    "specific insight referencing real numbers",
+    "specific insight referencing real numbers"
   ],
-  "recommendation": "one concrete, actionable recommendation"
+  "recommendation": "one concrete action — name the carrier, route, or metric"
 }
 
-Rules:
-- Stats must reference numbers from historical data
-- Insights must be specific, not generic
-- Recommendation must be a concrete action (e.g. 'Add X as backup carrier for Y lane')`;
-}
-
-function buildFreightAuditPrompt(carrier, incidentType, route, originalCostEur, additionalCostEur) {
-  return `Write a short professional freight audit claim notice.
-
-Carrier: ${carrier}
-Incident type: ${incidentType}
-Route: ${route}
-Original contracted cost: €${originalCostEur.toLocaleString()}
-Additional cost incurred due to incident: €${additionalCostEur.toLocaleString()}
-
-Write 2 paragraphs: first stating the facts of the incident and costs, second formally requesting reimbursement.
-Be factual, firm, and professional. Return only the plain text. No JSON, no markdown.`;
+Use actual numbers from historical data. Do not invent statistics.`;
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
@@ -183,98 +193,76 @@ async function callOpenAI(prompt, expectJson = true) {
     ...(expectJson && { response_format: { type: "json_object" } }),
   });
   const text = response.choices[0].message.content.trim();
-  if (expectJson) {
-    return JSON.parse(text);
-  }
-  return text;
-}
-
-function validIncidentType(type) {
-  return ["breakdown", "weather", "cancellation"].includes(type);
+  return expectJson ? JSON.parse(text) : text;
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 
-// Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "Logistics Incident Copilot API", model: MODEL });
+  res.json({
+    status: "ok", service: "Logistics Incident Copilot API v2", model: MODEL,
+    db: { carriers: db.carriers.length, shipments: db.shipments.length, incidents: db.incidents.length },
+  });
 });
 
-/**
- * POST /api/analyze-incident
- * Triggered immediately when an incident occurs.
- * Returns severity, key facts, and 3 resolution options.
- *
- * Body:
- * {
- *   incidentType: "breakdown" | "weather" | "cancellation",
- *   incidentDescription: "string",
- *   shipment: { shipmentId, route, cargo, carrier, carrierId,
- *               client, eta, value, position, kmLeft, hoursToDeadline }
- * }
- */
-app.post("/api/analyze-incident", async (req, res) => {
-  const { incidentType, incidentDescription, shipment } = req.body;
+app.get("/api/shipments", (req, res) => {
+  res.json({ success: true, shipments: db.shipments });
+});
 
-  if (!validIncidentType(incidentType)) {
+app.get("/api/carriers", (req, res) => {
+  res.json({ success: true, carriers: db.carriers });
+});
+
+app.post("/api/analyze-incident", async (req, res) => {
+  const { shipmentId, incidentType, incidentDescription } = req.body;
+
+  if (!["breakdown", "weather", "cancellation"].includes(incidentType)) {
     return res.status(400).json({ error: "Invalid incidentType" });
   }
-  if (!incidentDescription || !shipment) {
-    return res.status(400).json({ error: "incidentDescription and shipment are required" });
-  }
+
+  const shipment = getShipment(shipmentId);
+  if (!shipment) return res.status(404).json({ error: `Shipment ${shipmentId} not found` });
+
+  const carrier = getCarrier(shipment.carrier_id);
+  if (!carrier) return res.status(404).json({ error: `Carrier not found` });
+
+  const backupCarriers = findBackupCarriers(
+    shipment.route, shipment.cargo_type, shipment.temp_required, shipment.carrier_id
+  );
+  const history = getIncidentHistory(incidentType, shipment.carrier_id, shipment.route);
 
   try {
-    const prompt = buildAnalysisPrompt(incidentType, incidentDescription, shipment);
-    const analysis = await callOpenAI(prompt, true);
-    res.json({ success: true, analysis });
+    const analysis = await callOpenAI(
+      buildAnalysisPrompt(incidentType, incidentDescription, shipment, carrier, backupCarriers, history),
+      true
+    );
+    res.json({ success: true, analysis, context: { shipment, carrier, backupCarriers: backupCarriers.slice(0, 3), history } });
   } catch (err) {
     console.error("[analyze-incident]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/generate-actions
- * Called after dispatcher selects a resolution option.
- * Returns client email + lessons learned (two parallel AI calls).
- *
- * Body:
- * {
- *   incidentType: "breakdown" | "weather" | "cancellation",
- *   selectedOption: "A" | "B" | "C",
- *   optionDetails: { actionCarrier, actionEta, costDelta },
- *   shipment: { ...same as above }
- * }
- */
 app.post("/api/generate-actions", async (req, res) => {
-  const { incidentType, selectedOption, optionDetails, shipment } = req.body;
+  const { shipmentId, incidentType, selectedOption, optionDetails } = req.body;
 
-  if (!validIncidentType(incidentType)) {
-    return res.status(400).json({ error: "Invalid incidentType" });
-  }
-  if (!selectedOption || !optionDetails || !shipment) {
-    return res.status(400).json({ error: "selectedOption, optionDetails, and shipment are required" });
-  }
+  const shipment = getShipment(shipmentId);
+  if (!shipment) return res.status(404).json({ error: `Shipment ${shipmentId} not found` });
+
+  const carrier = getCarrier(shipment.carrier_id);
+  const history = getIncidentHistory(incidentType, shipment.carrier_id, shipment.route);
 
   try {
-    // Run both AI calls in parallel
     const [clientMessage, lessons] = await Promise.all([
       callOpenAI(buildClientMessagePrompt(incidentType, selectedOption, optionDetails, shipment), false),
-      callOpenAI(buildLessonsPrompt(incidentType, selectedOption, shipment), true),
+      callOpenAI(buildLessonsPrompt(incidentType, shipment, carrier, history), true),
     ]);
-
     res.json({
-      success: true,
-      clientMessage,
-      lessonsLearned: lessons,
+      success: true, clientMessage, lessonsLearned: lessons,
       auditLog: {
-        shipmentId: shipment.shipmentId,
-        incidentType,
-        selectedOption,
-        newCarrier: optionDetails.actionCarrier,
-        newEta: optionDetails.actionEta,
-        costDelta: optionDetails.costDelta,
-        resolvedAt: new Date().toISOString(),
+        shipmentId: shipment.id, incidentType, selectedOption,
+        newCarrier: optionDetails.action_carrier, newEta: optionDetails.action_eta,
+        costDelta: optionDetails.cost_delta, resolvedAt: new Date().toISOString(),
       },
     });
   } catch (err) {
@@ -283,32 +271,22 @@ app.post("/api/generate-actions", async (req, res) => {
   }
 });
 
-/**
- * POST /api/freight-audit
- * Optional: Generate a formal carrier claim notice.
- *
- * Body:
- * {
- *   carrier: "string",
- *   incidentType: "string",
- *   route: "string",
- *   originalCostEur: number,
- *   additionalCostEur: number
- * }
- */
 app.post("/api/freight-audit", async (req, res) => {
-  const { carrier, incidentType, route, originalCostEur, additionalCostEur } = req.body;
+  const { shipmentId, additionalCostEur } = req.body;
+  const shipment = getShipment(shipmentId);
+  if (!shipment) return res.status(404).json({ error: "Shipment not found" });
+  const carrier = getCarrier(shipment.carrier_id);
 
-  if (!carrier || !route || !originalCostEur || !additionalCostEur) {
-    return res.status(400).json({ error: "carrier, route, originalCostEur, additionalCostEur are required" });
-  }
+  const prompt = `Write a 2-paragraph professional freight audit claim.
+Carrier: ${carrier?.name}. Route: ${shipment.route}.
+Original cost: €${Math.round(shipment.km_left * (carrier?.price_per_km_eur || 1.5)).toLocaleString()}.
+Additional cost: €${additionalCostEur.toLocaleString()}. Reason: emergency carrier replacement.
+Paragraph 1: facts. Paragraph 2: reimbursement request. Plain text only.`;
 
   try {
-    const prompt = buildFreightAuditPrompt(carrier, incidentType, route, originalCostEur, additionalCostEur);
     const claimText = await callOpenAI(prompt, false);
     res.json({ success: true, claimText });
   } catch (err) {
-    console.error("[freight-audit]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -317,8 +295,7 @@ app.post("/api/freight-audit", async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n🚚 Logistics Incident Copilot API`);
-  console.log(`   Running on http://localhost:${PORT}`);
-  console.log(`   Model: ${MODEL}`);
-  console.log(`   Docs: http://localhost:${PORT}/health\n`);
+  console.log(`\n🚚 Logistics Incident Copilot API v2`);
+  console.log(`   http://localhost:${PORT}`);
+  console.log(`   DB: ${db.carriers.length} carriers · ${db.shipments.length} shipments · ${db.incidents.length} incidents\n`);
 });
