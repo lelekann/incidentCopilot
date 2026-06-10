@@ -5,7 +5,14 @@ export function getShipment(shipmentId) {
 }
 
 export function getCarrier(carrierId) {
-  return db.carriers.find((c) => c.id === carrierId) || null;
+  const carrier = db.carriers.find(c => c.id === carrierId);
+
+  if (!carrier) {
+    console.warn(`[DB] Missing carrier: ${carrierId}`);
+    return null;
+  }
+
+  return carrier;
 }
 
 export function findBackupCarriers(route, cargoType, tempRequired, excludeCarrierId) {
